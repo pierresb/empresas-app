@@ -199,3 +199,143 @@ def prepare_all_for_month(year: int, month: int, datasets: list[str] | None = No
                     logs.append(("error", dataset, url, f"Falha: {e}"))
     return logs
 # ===================== FIM DO BLOCO NOVO =====================
+
+# ===================== BLOCO DE CATÁLOGO (FINAL DO loaders.py) =====================
+from datetime import datetime
+
+def _ensure_catalog():
+    """Cria a tabela de catálogo se não existir."""
+    con = open_con()
+    try:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS catalog (
+              id BIGINT,
+              dataset TEXT NOT NULL,
+              month_ref TEXT NOT NULL,        -- 'YYYY-MM'
+              source_url TEXT,
+              parquet_path TEXT NOT NULL,
+              rows BIGINT,
+              loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    finally:
+        con.close()
+
+def _count_rows_in_parquet(parquet_path: Path) -> int | None:
+    try:
+        con = open_con()
+        try:
+            return con.execute(
+                f"SELECT COUNT(*) AS n FROM parquet_scan('{parquet_path.as_posix()}')"
+            ).fetchone()[0]
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+def add_to_catalog(dataset: str, month_ref: str, parquet_path: Path, source_url: str | None):
+    """Insere um registro no catálogo."""
+    _ensure_catalog()
+    rows = _count_rows_in_parquet(parquet_path)
+    con = open_con()
+    try:
+        con.execute(
+            "INSERT INTO catalog (id, dataset, month_ref, source_url, parquet_path, rows, loaded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                None,  # id (sem PK/auto-inc; pode ficar NULL)
+                dataset,
+                month_ref,
+                source_url or "",
+                parquet_path.as_posix(),
+                rows if rows is not None else None,
+                datetime.now(),
+            )
+        )
+    finally:
+        con.close()
+
+def get_catalog():
+    """Retorna o catálogo ordenado do mais recente para o mais antigo."""
+    _ensure_catalog()
+    return query("""
+        SELECT
+          COALESCE(id, ROW_NUMBER() OVER (ORDER BY loaded_at DESC)) AS id,
+          dataset, month_ref, source_url, parquet_path, rows, loaded_at
+        FROM catalog
+        ORDER BY loaded_at DESC
+    """)
+
+# ---- Reexport: URL do mês já existe no arquivo; se não, mantenha aqui para a página usar ----
+def month_dir_url(year: int, month: int) -> str:
+    return f"https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/{year:04d}-{month:02d}/"
+
+# Atualize o wizard para registrar em catálogo:
+# Substitua a função prepare_all_for_month que você tem por esta versão (mesma assinatura, agora com add_to_catalog)
+def prepare_all_for_month(year: int, month: int, datasets: list[str] | None = None) -> list[tuple[str, str, str, str]]:
+    """
+    Baixa e prepara todos os datasets escolhidos para um determinado mês/ano.
+    Retorna lista de logs: (status, dataset, url, msg).
+    Também grava um registro no catálogo para cada parquet gerado com sucesso.
+    """
+    base = month_dir_url(year, month)
+
+    # nomes esperados por dataset (alguns meses não têm todos; tudo bem)
+    expected = {
+        "empresas": ["Empresas1.zip", "Empresas2.zip"],
+        "estabelecimentos": ["Estabelecimentos1.zip", "Estabelecimentos2.zip", "Estabelecimentos3.zip"],
+        "socios": ["Socios1.zip", "Socios2.zip"],
+        "simples": ["Simples.zip"],
+        "paises": ["Paises.zip"],
+        "municipios": ["Municipios.zip"],
+        "qualificacoes": ["Qualificacoes.zip"],
+        "naturezas": ["Naturezas.zip"],
+        "cnaes": ["Cnaes.zip"],
+    }
+    # keywords para pegar o arquivo interno certo dentro do ZIP, mesmo sem extensão
+    kw = {
+        "empresas": ["empresas", "empresa"],
+        "estabelecimentos": ["estabelec", "estabelecimentos"],
+        "socios": ["socios", "sócios", "socio"],
+        "simples": ["simples", "mei"],
+        "paises": ["paises", "países", "pais"],
+        "municipios": ["municipio", "municípios", "municipios"],
+        "qualificacoes": ["qualificacao", "qualificações", "qualificacoes"],
+        "naturezas": ["natureza", "naturezas"],
+        "cnaes": ["cnae", "cnaes"],
+    }
+
+    targets = datasets or list(expected.keys())
+    month_ref = f"{year:04d}-{month:02d}"
+    logs: list[tuple[str, str, str, str]] = []
+
+    for dataset in targets:
+        files = expected.get(dataset, [])
+        if not files:
+            logs.append(("warn", dataset, base, "Sem arquivos esperados configurados para este dataset"))
+            continue
+
+        keywords = kw.get(dataset, [dataset])
+
+        for fname in files:
+            url = base + fname
+            try:
+                zip_path = DATA / f"{dataset}_{year:04d}{month:02d}_{fname}"
+                download_zip(url, zip_path)
+
+                fobj = extract_tabular_from_zip(zip_path, prefer_keywords=keywords)
+                parquet = read_csv_semicolon_to_parquet(fobj, dataset)
+                ensure_table_from_parquet(dataset, parquet, replace=True)
+
+                # registra catálogo
+                add_to_catalog(dataset, month_ref, parquet, url)
+
+                logs.append(("ok", dataset, url, f"Preparado: {parquet.name}"))
+            except Exception as e:
+                err = str(e)
+                if "404" in err or "Not Found" in err:
+                    logs.append(("warn", dataset, url, "Arquivo não disponível no mês/ano informado"))
+                else:
+                    logs.append(("error", dataset, url, f"Falha: {e}"))
+    return logs
+# ===================== FIM DO BLOCO DE CATÁLOGO =====================
