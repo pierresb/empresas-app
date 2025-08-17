@@ -121,3 +121,81 @@ def prepare_from_uploaded_csv_bytes(csv_bytes: bytes, name: str) -> Path:
     parquet = read_csv_semicolon_to_parquet(fobj, name)
     ensure_table_from_parquet(name, parquet, replace=True)
     return parquet
+    
+# ===================== BLOCO NOVO (FINAL DO loaders.py) =====================
+
+# Nomes esperados por mês/ano (pastas oficiais da RFB). Nem todos os meses têm todos os arquivos.
+_EXPECTED_FILES = {
+    "empresas": ["Empresas1.zip", "Empresas2.zip"],
+    "estabelecimentos": ["Estabelecimentos1.zip", "Estabelecimentos2.zip", "Estabelecimentos3.zip"],
+    "socios": ["Socios1.zip", "Socios2.zip"],
+    "simples": ["Simples.zip"],
+    "paises": ["Paises.zip"],
+    "municipios": ["Municipios.zip"],
+    "qualificacoes": ["Qualificacoes.zip"],
+    "naturezas": ["Naturezas.zip"],
+    "cnaes": ["Cnaes.zip"],
+}
+
+# Palavras-chave para localizar o arquivo interno “sem extensão” dentro do ZIP
+_DATASET_KEYWORDS = {
+    "empresas": ["empresas", "empresa"],
+    "estabelecimentos": ["estabelec", "estabelecimentos"],
+    "socios": ["socios", "sócios", "socio"],
+    "simples": ["simples", "mei"],
+    "paises": ["paises", "países", "pais"],
+    "municipios": ["municipio", "municípios", "municipios"],
+    "qualificacoes": ["qualificacao", "qualificações", "qualificacoes"],
+    "naturezas": ["natureza", "naturezas"],
+    "cnaes": ["cnae", "cnaes"],
+}
+
+def month_dir_url(year: int, month: int) -> str:
+    """
+    Retorna a URL canônica do diretório de um mês/ano no portal de dados abertos da RFB.
+    Ex.: 2025-06 → https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/2025-06/
+    """
+    return f"https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/{year:04d}-{month:02d}/"
+
+def prepare_all_for_month(year: int, month: int, datasets: list[str] | None = None) -> list[tuple[str, str, str, str]]:
+    """
+    Baixa e prepara todos os datasets escolhidos para um determinado mês/ano.
+    Retorna uma lista de tuplas de log: (status, dataset, url, msg)
+      - status: 'ok' | 'warn' | 'error'
+      - dataset: nome lógico (empresas, estabelecimentos, ...)
+      - url: URL tentada (arquivo ZIP)
+      - msg: mensagem resumida do resultado ou do erro
+    """
+    base = month_dir_url(year, month)
+    targets = datasets or list(_EXPECTED_FILES.keys())
+    logs: list[tuple[str, str, str, str]] = []
+
+    for dataset in targets:
+        files = _EXPECTED_FILES.get(dataset, [])
+        if not files:
+            logs.append(("warn", dataset, base, "Sem arquivos esperados configurados para este dataset"))
+            continue
+
+        keywords = _DATASET_KEYWORDS.get(dataset, [dataset])
+
+        for fname in files:
+            url = base + fname
+            try:
+                zip_path = DATA / f"{dataset}_{year:04d}{month:02d}_{fname}"
+                # download pode falhar se o arquivo não existir no mês — tratamos como aviso
+                download_zip(url, zip_path)
+
+                fobj = extract_tabular_from_zip(zip_path, prefer_keywords=keywords)
+                parquet = read_csv_semicolon_to_parquet(fobj, dataset)
+                ensure_table_from_parquet(dataset, parquet, replace=True)
+
+                logs.append(("ok", dataset, url, f"Preparado: {parquet.name}"))
+            except Exception as e:
+                # alguns meses não têm todos os pacotes → registrar e seguir
+                err = str(e)
+                if "404" in err or "Not Found" in err:
+                    logs.append(("warn", dataset, url, "Arquivo não disponível no mês/ano informado"))
+                else:
+                    logs.append(("error", dataset, url, f"Falha: {e}"))
+    return logs
+# ===================== FIM DO BLOCO NOVO =====================
